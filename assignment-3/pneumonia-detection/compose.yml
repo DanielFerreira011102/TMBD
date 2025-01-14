@@ -1,0 +1,157 @@
+services:
+  # Infrastructure services
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    ports:
+      - "5672:5672"   # AMQP protocol
+      - "15672:15672" # Management UI (http://localhost:15672, guest/guest)
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    environment:
+      - BACKEND_STORE_URI=/mlflow/mlflow.db
+      - DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+    depends_on:
+      - redis
+
+  # Application services
+  api:
+    build:
+      context: .
+      dockerfile: src/api/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - shared-models:/app/models  # Use shared volume
+    environment:
+      - MODEL_PATH=/app/models/final_federated_model.pth
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CACHE_TTL=3600
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/orchestrator.Dockerfile
+    volumes:
+      - shared-models:/app/models  # Use shared volume
+      - ./logs:/app/logs
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - NUM_CLIENTS=3
+      - MIN_CLIENTS=2
+      - ROUNDS=10
+    depends_on:
+      - rabbitmq
+      - mlflow
+
+  # Simulated institution clients
+  institution1:
+    build:
+      context: .
+      dockerfile: docker/client.Dockerfile
+    volumes:
+      # Only mount this institution's data directory
+      - ./data/institution1:/app/data
+    shm_size: '2gb'
+    environment:
+      - CLIENT_ID=institution1
+      - RABBITMQ_HOST=rabbitmq
+      - DATA_DIR=/app/data
+      - LOCAL_EPOCHS=5
+      - BATCH_SIZE=32
+      - NUM_WORKERS=2
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+
+  institution2:
+    build:
+      context: .
+      dockerfile: docker/client.Dockerfile
+    volumes:
+      # Only mount this institution's data directory
+      - ./data/institution2:/app/data
+    shm_size: '2gb'
+    environment:
+      - CLIENT_ID=institution2
+      - RABBITMQ_HOST=rabbitmq
+      - DATA_DIR=/app/data
+      - LOCAL_EPOCHS=5
+      - BATCH_SIZE=32
+      - NUM_WORKERS=2
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+
+  institution3:
+    build:
+      context: .
+      dockerfile: docker/client.Dockerfile
+    volumes:
+      # Only mount this institution's data directory
+      - ./data/institution3:/app/data
+    shm_size: '2gb'
+    environment:
+      - CLIENT_ID=institution3
+      - RABBITMQ_HOST=rabbitmq
+      - DATA_DIR=/app/data
+      - LOCAL_EPOCHS=5
+      - BATCH_SIZE=32
+      - NUM_WORKERS=2
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+
+volumes:
+  mlflow-data:
+  redis-data:
+  shared-models:
