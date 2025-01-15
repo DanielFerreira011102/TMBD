@@ -279,8 +279,60 @@ class FederatedClient:
         )
         self.was_consuming = True
 
+    def _calculate_metrics(self, outputs, targets):
+        """Calculate comprehensive metrics for model evaluation including sample counts"""
+        _, predicted = outputs.max(1)
+        correct = predicted.eq(targets)
+        total_samples = len(targets)
+        correct_samples = correct.sum().item()
+        incorrect_samples = total_samples - correct_samples
+        
+        # Calculate true positives, false positives, false negatives for each class
+        num_classes = outputs.size(1)
+        tp = torch.zeros(num_classes)
+        fp = torch.zeros(num_classes)
+        fn = torch.zeros(num_classes)
+        
+        for c in range(num_classes):
+            tp[c] = ((predicted == c) & (targets == c)).sum().item()
+            fp[c] = ((predicted == c) & (targets != c)).sum().item()
+            fn[c] = ((predicted != c) & (targets == c)).sum().item()
+        
+        # Calculate metrics for each class
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+        
+        # Calculate macro and weighted averages
+        macro_precision = precision.mean().item()
+        macro_recall = recall.mean().item()
+        macro_f1 = f1.mean().item()
+        
+        # Calculate weighted averages based on class distribution
+        class_counts = torch.bincount(targets, minlength=num_classes).float()
+        weights = class_counts / class_counts.sum()
+        weighted_precision = (precision * weights).sum().item()
+        weighted_recall = (recall * weights).sum().item()
+        weighted_f1 = (f1 * weights).sum().item()
+        
+        return {
+            'accuracy': correct.float().mean().item() * 100,
+            'correct_samples': correct_samples,
+            'incorrect_samples': incorrect_samples,
+            'total_samples_batch': total_samples,
+            'per_class_precision': precision.tolist(),
+            'per_class_recall': recall.tolist(),
+            'per_class_f1': f1.tolist(),
+            'macro_precision': macro_precision * 100,
+            'macro_recall': macro_recall * 100,
+            'macro_f1': macro_f1 * 100,
+            'weighted_precision': weighted_precision * 100,
+            'weighted_recall': weighted_recall * 100,
+            'weighted_f1': weighted_f1 * 100
+        }
+
     def _train_local_model(self) -> Optional[Dict[str, float]]:
-        """Perform local training with improved heartbeat and memory handling"""
+        """Perform local training with comprehensive metrics"""
         try:
             self.model.train()
             epoch_metrics = []
@@ -288,13 +340,12 @@ class FederatedClient:
             
             for epoch in range(self.local_epochs):
                 epoch_loss = 0
-                epoch_correct = 0
-                epoch_total = 0
-                batch_losses = []
-                batch_accuracies = []
+                all_outputs = []
+                all_targets = []
+                batch_metrics = []
                 
                 for batch_idx, (data, target) in enumerate(self.train_loader):
-                    # Process heartbeat every few batches
+                    # Process heartbeat
                     if batch_idx % 5 == 0:
                         if not self._process_heartbeat():
                             if not self._handle_connection_error():
@@ -311,30 +362,30 @@ class FederatedClient:
                         loss.backward()
                         self.optimizer.step()
 
+                        # Store outputs and targets for epoch-level metrics
+                        all_outputs.append(output.detach())
+                        all_targets.append(target)
+                        
                         batch_loss = loss.item()
-                        batch_losses.append(batch_loss)
                         epoch_loss += batch_loss
 
-                        _, predicted = output.max(1)
-                        batch_correct = predicted.eq(target).sum().item()
-                        batch_accuracy = 100. * batch_correct / batch_size
-                        batch_accuracies.append(batch_accuracy)
+                        # Calculate batch metrics
+                        batch_metric = self._calculate_metrics(output, target)
+                        batch_metric['loss'] = batch_loss
+                        batch_metrics.append(batch_metric)
                         
-                        epoch_correct += batch_correct
-                        epoch_total += batch_size
+                        total_samples += batch_size
 
                         # Log progress
                         if batch_idx % 10 == 0:
-                            current_samples = batch_idx * batch_size
-                            total_samples = len(self.train_loader.dataset)
                             logger.info(f"Epoch {epoch + 1}/{self.local_epochs} "
-                                    f"[{current_samples}/{total_samples} "
-                                    f"({100. * batch_idx / len(self.train_loader):.0f}%)] "
+                                    f"[{batch_idx * batch_size}/{len(self.train_loader.dataset)}] "
                                     f"Loss: {batch_loss:.4f} "
-                                    f"Accuracy: {batch_accuracy:.2f}%")
+                                    f"Accuracy: {batch_metric['accuracy']:.2f}% "
+                                    f"F1: {batch_metric['macro_f1']:.2f}%")
 
-                        # Free up memory
-                        del data, target, output, loss, predicted
+                        # Free memory
+                        del data, target, output, loss
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
@@ -342,48 +393,65 @@ class FederatedClient:
                         logger.error(f"Error processing batch: {str(e)}")
                         continue
 
-                # Calculate epoch statistics
-                if len(batch_losses) > 0:  # Only if we processed at least one batch
-                    epoch_avg_loss = epoch_loss / len(self.train_loader)
-                    epoch_accuracy = 100. * epoch_correct / epoch_total
+                # Calculate epoch-level metrics
+                try:
+                    epoch_outputs = torch.cat(all_outputs)
+                    epoch_targets = torch.cat(all_targets)
+                    epoch_metrics_dict = self._calculate_metrics(epoch_outputs, epoch_targets)
+                    epoch_metrics_dict['epoch'] = epoch
+                    epoch_metrics_dict['loss'] = epoch_loss / len(self.train_loader)
                     
-                    # Store epoch metrics
-                    epoch_metrics.append({
-                        'epoch': epoch,
-                        'loss': epoch_avg_loss,
-                        'accuracy': epoch_accuracy,
-                        'min_batch_loss': min(batch_losses),
-                        'max_batch_loss': max(batch_losses),
-                        'min_batch_accuracy': min(batch_accuracies),
-                        'max_batch_accuracy': max(batch_accuracies)
+                    # Store batch-level statistics
+                    epoch_metrics_dict.update({
+                        'min_batch_loss': min(m['loss'] for m in batch_metrics),
+                        'max_batch_loss': max(m['loss'] for m in batch_metrics),
+                        'min_batch_accuracy': min(m['accuracy'] for m in batch_metrics),
+                        'max_batch_accuracy': max(m['accuracy'] for m in batch_metrics),
+                        'min_batch_f1': min(m['macro_f1'] for m in batch_metrics),
+                        'max_batch_f1': max(m['macro_f1'] for m in batch_metrics)
                     })
                     
-                    total_samples += epoch_total
-                else:
-                    logger.error(f"No batches processed in epoch {epoch + 1}")
+                    epoch_metrics.append(epoch_metrics_dict)
+                    
+                except Exception as e:
+                    logger.error(f"Error calculating epoch metrics: {str(e)}")
                     return None
 
-            if not epoch_metrics:  # If no epochs were completed successfully
+                # Free memory
+                del all_outputs, all_targets
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if not epoch_metrics:
                 return None
 
-            # Calculate final metrics
-            losses = [m['loss'] for m in epoch_metrics]
-            accuracies = [m['accuracy'] for m in epoch_metrics]
+                        # Calculate final metrics across epochs
+            total_correct = sum(m['correct_samples'] for m in epoch_metrics)
+            total_incorrect = sum(m['incorrect_samples'] for m in epoch_metrics)
             
-            metrics = {
-                'loss': sum(losses) / len(losses),
-                'accuracy': sum(accuracies) / len(accuracies),
-                'min_loss': min(losses),
-                'max_loss': max(losses),
-                'std_loss': torch.tensor(losses).std().item(),
-                'min_accuracy': min(accuracies),
-                'max_accuracy': max(accuracies),
-                'std_accuracy': torch.tensor(accuracies).std().item(),
+            final_metrics = {
+                'loss': sum(m['loss'] for m in epoch_metrics) / len(epoch_metrics),
+                'accuracy': sum(m['accuracy'] for m in epoch_metrics) / len(epoch_metrics),
+                'total_correct_samples': total_correct,
+                'total_incorrect_samples': total_incorrect,
+                'total_samples_processed': total_correct + total_incorrect,
+                'macro_precision': sum(m['macro_precision'] for m in epoch_metrics) / len(epoch_metrics),
+                'macro_recall': sum(m['macro_recall'] for m in epoch_metrics) / len(epoch_metrics),
+                'macro_f1': sum(m['macro_f1'] for m in epoch_metrics) / len(epoch_metrics),
+                'weighted_precision': sum(m['weighted_precision'] for m in epoch_metrics) / len(epoch_metrics),
+                'weighted_recall': sum(m['weighted_recall'] for m in epoch_metrics) / len(epoch_metrics),
+                'weighted_f1': sum(m['weighted_f1'] for m in epoch_metrics) / len(epoch_metrics),
+                'min_loss': min(m['loss'] for m in epoch_metrics),
+                'max_loss': max(m['loss'] for m in epoch_metrics),
+                'std_loss': torch.tensor([m['loss'] for m in epoch_metrics]).std().item(),
+                'min_accuracy': min(m['accuracy'] for m in epoch_metrics),
+                'max_accuracy': max(m['accuracy'] for m in epoch_metrics),
+                'std_accuracy': torch.tensor([m['accuracy'] for m in epoch_metrics]).std().item(),
                 'total_samples': total_samples,
                 'epoch_metrics': epoch_metrics
             }
 
-            return metrics
+            return final_metrics
 
         except Exception as e:
             logger.error(f"Error in training loop: {str(e)}")

@@ -496,71 +496,123 @@ class FederatedOrchestrator:
             logger.error(f"Error saving model: {str(e)}")
 
     def _aggregate_and_log_metrics(self, round_num: int):
-        """Aggregate and log metrics with improved MLflow tracking"""
+        """Aggregate and log comprehensive metrics with improved MLflow tracking"""
         if not self.received_updates:
             return
 
         try:
             # Calculate aggregate statistics
-            losses = [m['metrics']['loss'] for m in self.received_updates.values()]
-            accuracies = [m['metrics']['accuracy'] for m in self.received_updates.values()]
-            total_samples = sum(m['metrics']['total_samples'] for m in self.received_updates.values())
-
-            # Global metrics for this round
-            global_metrics = {
-                "global/loss": sum(losses) / len(losses),
-                "global/accuracy": sum(accuracies) / len(accuracies),
-                "global/min_loss": min(losses),
-                "global/max_loss": max(losses),
-                "global/min_accuracy": min(accuracies),
-                "global/max_accuracy": max(accuracies),
-                "global/std_loss": torch.tensor(losses).std().item(),
-                "global/std_accuracy": torch.tensor(accuracies).std().item(),
-                "training/active_clients": len(self.received_updates),
-                "training/total_samples": total_samples
-            }
+            metric_keys = [
+                'loss', 'accuracy', 
+                'macro_precision', 'macro_recall', 'macro_f1',
+                'weighted_precision', 'weighted_recall', 'weighted_f1'
+            ]
             
-            # Log global metrics with step
+            # Initialize counters for correct/incorrect samples
+            total_correct_samples = 0
+            total_incorrect_samples = 0
+            total_samples_processed = 0
+            
+            metrics_lists = {key: [] for key in metric_keys}
+            total_samples = 0
+
+            # Collect metrics from all clients
+            for update in self.received_updates.values():
+                metrics = update['metrics']
+                for key in metric_keys:
+                    metrics_lists[key].append(metrics[key])
+                total_samples += metrics['total_samples']
+                total_correct_samples += metrics['total_correct_samples']
+                total_incorrect_samples += metrics['total_incorrect_samples']
+                total_samples_processed += metrics['total_samples_processed']
+
+            # Convert to tensors for statistical calculations
+            metrics_tensors = {
+                key: torch.tensor(values) for key, values in metrics_lists.items()
+            }
+
+            # Calculate global metrics
+            global_metrics = {
+                f"global/{key}": metrics_tensors[key].mean().item() 
+                for key in metric_keys
+            }
+
+            # Add min/max/std for each metric
+            for key in metric_keys:
+                global_metrics.update({
+                    f"global/min_{key}": metrics_tensors[key].min().item(),
+                    f"global/max_{key}": metrics_tensors[key].max().item(),
+                    f"global/std_{key}": metrics_tensors[key].std().item()
+                })
+
+            # Add training metadata including sample counts
+            global_metrics.update({
+                "training/active_clients": len(self.received_updates),
+                "training/total_samples": total_samples,
+                "training/total_correct_samples": total_correct_samples,
+                "training/total_incorrect_samples": total_incorrect_samples,
+                "training/total_samples_processed": total_samples_processed,
+                "training/global_accuracy": (total_correct_samples / total_samples_processed * 100) if total_samples_processed > 0 else 0
+            })
+
+            # Log global metrics
             mlflow.log_metrics(global_metrics, step=round_num)
 
             # Per-client metrics
             for client_id, update in self.received_updates.items():
                 metrics = update['metrics']
-                client_metrics = {
-                    f"clients/{client_id}/loss": metrics['loss'],
-                    f"clients/{client_id}/accuracy": metrics['accuracy'],
-                    f"clients/{client_id}/min_loss": metrics['min_loss'],
-                    f"clients/{client_id}/max_loss": metrics['max_loss'],
-                    f"clients/{client_id}/std_loss": metrics['std_loss'],
-                    f"clients/{client_id}/min_accuracy": metrics['min_accuracy'],
-                    f"clients/{client_id}/max_accuracy": metrics['max_accuracy'],
-                    f"clients/{client_id}/std_accuracy": metrics['std_accuracy'],
-                    f"clients/{client_id}/total_samples": metrics['total_samples']
-                }
+                client_metrics = {}
+
+                # Log main metrics
+                for key in metric_keys:
+                    client_metrics[f"clients/{client_id}/{key}"] = metrics[key]
+
+                # Log min/max/std metrics
+                for key in ['loss', 'accuracy']:
+                    client_metrics.update({
+                        f"clients/{client_id}/min_{key}": metrics[f'min_{key}'],
+                        f"clients/{client_id}/max_{key}": metrics[f'max_{key}'],
+                        f"clients/{client_id}/std_{key}": metrics[f'std_{key}']
+                    })
+
+                client_metrics[f"clients/{client_id}/total_samples"] = metrics['total_samples']
                 mlflow.log_metrics(client_metrics, step=round_num)
 
-                # Log per-epoch metrics for each client
+                # Log per-epoch metrics
                 if 'epoch_metrics' in metrics:
                     for epoch_data in metrics['epoch_metrics']:
                         epoch = epoch_data['epoch']
                         epoch_metrics = {
-                            f"clients/{client_id}/epochs/loss_{epoch}": epoch_data['loss'],
-                            f"clients/{client_id}/epochs/accuracy_{epoch}": epoch_data['accuracy'],
-                            f"clients/{client_id}/epochs/min_batch_loss_{epoch}": epoch_data['min_batch_loss'],
-                            f"clients/{client_id}/epochs/max_batch_loss_{epoch}": epoch_data['max_batch_loss'],
-                            f"clients/{client_id}/epochs/min_batch_accuracy_{epoch}": epoch_data['min_batch_accuracy'],
-                            f"clients/{client_id}/epochs/max_batch_accuracy_{epoch}": epoch_data['max_batch_accuracy']
+                            f"clients/{client_id}/epochs/{key}_{epoch}": epoch_data[key]
+                            for key in metric_keys
                         }
+                        
+                        # Add batch-level metrics
+                        batch_keys = [
+                            'min_batch_loss', 'max_batch_loss',
+                            'min_batch_accuracy', 'max_batch_accuracy',
+                            'min_batch_f1', 'max_batch_f1'
+                        ]
+                        for key in batch_keys:
+                            epoch_metrics[f"clients/{client_id}/epochs/{key}_{epoch}"] = epoch_data[key]
+                        
                         mlflow.log_metrics(epoch_metrics, step=round_num)
 
-            logger.info(f"Round {round_num + 1} metrics - "
-                       f"Mean Loss: {global_metrics['global/loss']:.4f}, "
-                       f"Mean Accuracy: {global_metrics['global/accuracy']:.2f}%, "
-                       f"Participants: {len(self.received_updates)}")
+            # Log summary for current round
+            logger.info(
+                f"Round {round_num + 1} metrics - "
+                f"Loss: {global_metrics['global/loss']:.4f}, "
+                f"Accuracy: {global_metrics['global/accuracy']:.2f}%, "
+                f"F1 Score: {global_metrics['global/macro_f1']:.2f}%, "
+                f"Correct Samples: {total_correct_samples}, "
+                f"Incorrect Samples: {total_incorrect_samples}, "
+                f"Precision: {global_metrics['global/macro_precision']:.2f}%, "
+                f"Recall: {global_metrics['global/macro_recall']:.2f}%, "
+                f"Participants: {len(self.received_updates)}"
+            )
 
         except Exception as e:
             logger.error(f"Error aggregating and logging metrics: {str(e)}")
-
 
 if __name__ == "__main__":
     # Get configuration from environment variables
