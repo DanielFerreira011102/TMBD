@@ -5,7 +5,7 @@ import pika
 import json
 import io
 import time
-from typing import Dict
+from typing import Dict, Optional
 import os
 from pika.exceptions import AMQPConnectionError, AMQPChannelError
 
@@ -23,9 +23,10 @@ class FederatedClient:
         rabbitmq_host: str = "localhost",
         local_epochs: int = 5,
         batch_size: int = 32,
-        heartbeat: int = 600,  # Increased heartbeat timeout to 10 minutes
+        heartbeat: int = 600,  # 10 minutes
         connection_retry_delay: int = 5,
-        max_connection_retries: int = 3
+        max_connection_retries: int = 3,
+        message_ttl: int = 300000  # 5 minutes in milliseconds
     ):
         self.client_id = client_id
         self.data_dir = Path(data_dir)
@@ -35,6 +36,7 @@ class FederatedClient:
         self.heartbeat = heartbeat
         self.connection_retry_delay = connection_retry_delay
         self.max_connection_retries = max_connection_retries
+        self.message_ttl = message_ttl
         
         # Connection state tracking
         self.should_reconnect = False
@@ -49,7 +51,8 @@ class FederatedClient:
         # Create dataloaders
         self.train_loader, self.val_loader = create_dataloaders(
             data_dir=str(self.data_dir),
-            batch_size=batch_size
+            batch_size=batch_size,
+            num_workers=2
         )
 
         # Set device
@@ -72,8 +75,16 @@ class FederatedClient:
             blocked_connection_timeout=300,
             connection_attempts=3,
             retry_delay=5,
-            socket_timeout=300
+            socket_timeout=300,
+            channel_max=2,
+            frame_max=131072
         )
+
+    def _compress_state_dict(self, state_dict):
+        """Compress model state dict for efficient transmission"""
+        buffer = io.BytesIO()
+        torch.save(state_dict, buffer, _use_new_zipfile_serialization=True)
+        return buffer.getvalue()
 
     def connect(self):
         """Setup RabbitMQ connection with improved retry logic and error handling"""
@@ -93,32 +104,50 @@ class FederatedClient:
                 # Enable publisher confirms
                 self.channel.confirm_delivery()
 
-                # Declare exchange and queues with persistence
+                # Declare exchange and queues with persistence and message TTL
                 self.channel.exchange_declare(
                     exchange='global_model_exchange',
                     exchange_type='fanout',
                     durable=True
                 )
+                
+                # Declare exclusive queue for this client with message limits
                 result = self.channel.queue_declare(
                     queue='',
                     exclusive=True,
-                    durable=True
+                    arguments={
+                        'x-message-ttl': self.message_ttl,
+                        'x-max-length': 10,
+                        'x-overflow': 'drop-head'
+                    }
                 )
                 self.queue_name = result.method.queue
                 self.channel.queue_bind(
                     exchange='global_model_exchange',
                     queue=self.queue_name
                 )
+                
+                # Declare model updates queue with message limits
                 self.channel.queue_declare(
                     queue='model_updates',
-                    durable=True
+                    durable=True,
+                    arguments={
+                        'x-message-ttl': self.message_ttl,
+                        'x-max-length': 1000,
+                        'x-overflow': 'drop-head'
+                    }
                 )
                 
-                # Add registration queue
+                # Add registration queue with similar limits
                 self.registration_queue = 'client_registrations'
                 self.channel.queue_declare(
                     queue=self.registration_queue,
-                    durable=True
+                    durable=True,
+                    arguments={
+                        'x-message-ttl': self.message_ttl,
+                        'x-max-length': 1000,
+                        'x-overflow': 'drop-head'
+                    }
                 )
                 
                 logger.info("Successfully connected to RabbitMQ")
@@ -172,8 +201,9 @@ class FederatedClient:
                     routing_key=self.registration_queue,
                     body=json.dumps(registration_info).encode(),
                     properties=pika.BasicProperties(
-                        delivery_mode=2,  # make message persistent
-                        content_type='application/json'
+                        delivery_mode=2,
+                        content_type='application/json',
+                        expiration=str(self.message_ttl)
                     ),
                     mandatory=True
                 )
@@ -225,12 +255,19 @@ class FederatedClient:
 
                 logger.info(f"Received global model for round {round_num + 1}")
 
+                # Free up memory before training
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 # Perform local training
                 metrics = self._train_local_model()
 
-                # Send model update
-                self._send_model_update(round_num, metrics)
-
+                # Only send update if training was successful
+                if metrics is not None:
+                    self._send_model_update(round_num, metrics)
+                else:
+                    logger.error("Training failed, skipping model update")
+                    
             except Exception as e:
                 logger.error(f"Error processing global model: {str(e)}")
             finally:
@@ -242,89 +279,115 @@ class FederatedClient:
         )
         self.was_consuming = True
 
-    def _train_local_model(self) -> Dict[str, float]:
-        """Perform local training with improved heartbeat handling"""
-        self.model.train()
-        epoch_metrics = []
-        total_samples = 0
-        
-        for epoch in range(self.local_epochs):
-            epoch_loss = 0
-            epoch_correct = 0
-            epoch_total = 0
-            batch_losses = []
-            batch_accuracies = []
+    def _train_local_model(self) -> Optional[Dict[str, float]]:
+        """Perform local training with improved heartbeat and memory handling"""
+        try:
+            self.model.train()
+            epoch_metrics = []
+            total_samples = 0
             
-            for batch_idx, (data, target) in enumerate(self.train_loader):
-                # Process heartbeat every few batches with improved error handling
-                if batch_idx % 5 == 0:
-                    if not self._process_heartbeat():
-                        if not self._handle_connection_error():
-                            logger.error("Failed to handle connection error, continuing training...")
-
-                data, target = data.to(self.device), target.to(self.device)
-                batch_size = data.size(0)
-
-                self.optimizer.zero_grad()
-                output = self.model(data)
-                loss = self.criterion(output, target)
-                loss.backward()
-                self.optimizer.step()
-
-                batch_loss = loss.item()
-                batch_losses.append(batch_loss)
-                epoch_loss += batch_loss
-
-                _, predicted = output.max(1)
-                batch_correct = predicted.eq(target).sum().item()
-                batch_accuracy = 100. * batch_correct / batch_size
-                batch_accuracies.append(batch_accuracy)
+            for epoch in range(self.local_epochs):
+                epoch_loss = 0
+                epoch_correct = 0
+                epoch_total = 0
+                batch_losses = []
+                batch_accuracies = []
                 
-                epoch_correct += batch_correct
-                epoch_total += batch_size
+                for batch_idx, (data, target) in enumerate(self.train_loader):
+                    # Process heartbeat every few batches
+                    if batch_idx % 5 == 0:
+                        if not self._process_heartbeat():
+                            if not self._handle_connection_error():
+                                logger.error("Failed to handle connection error, stopping training")
+                                return None
 
-                if batch_idx % 10 == 0:
-                    logger.info(f"Epoch {epoch + 1}/{self.local_epochs} "
-                              f"[{batch_idx * len(data)}/{len(self.train_loader.dataset)} "
-                              f"({100. * batch_idx / len(self.train_loader):.0f}%)] "
-                              f"Loss: {batch_loss:.4f} "
-                              f"Accuracy: {batch_accuracy:.2f}%")
+                    try:
+                        data, target = data.to(self.device), target.to(self.device)
+                        batch_size = data.size(0)
 
-            # Calculate epoch statistics
-            epoch_avg_loss = epoch_loss / len(self.train_loader)
-            epoch_accuracy = 100. * epoch_correct / epoch_total
+                        self.optimizer.zero_grad()
+                        output = self.model(data)
+                        loss = self.criterion(output, target)
+                        loss.backward()
+                        self.optimizer.step()
+
+                        batch_loss = loss.item()
+                        batch_losses.append(batch_loss)
+                        epoch_loss += batch_loss
+
+                        _, predicted = output.max(1)
+                        batch_correct = predicted.eq(target).sum().item()
+                        batch_accuracy = 100. * batch_correct / batch_size
+                        batch_accuracies.append(batch_accuracy)
+                        
+                        epoch_correct += batch_correct
+                        epoch_total += batch_size
+
+                        # Log progress
+                        if batch_idx % 10 == 0:
+                            current_samples = batch_idx * batch_size
+                            total_samples = len(self.train_loader.dataset)
+                            logger.info(f"Epoch {epoch + 1}/{self.local_epochs} "
+                                    f"[{current_samples}/{total_samples} "
+                                    f"({100. * batch_idx / len(self.train_loader):.0f}%)] "
+                                    f"Loss: {batch_loss:.4f} "
+                                    f"Accuracy: {batch_accuracy:.2f}%")
+
+                        # Free up memory
+                        del data, target, output, loss, predicted
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {str(e)}")
+                        continue
+
+                # Calculate epoch statistics
+                if len(batch_losses) > 0:  # Only if we processed at least one batch
+                    epoch_avg_loss = epoch_loss / len(self.train_loader)
+                    epoch_accuracy = 100. * epoch_correct / epoch_total
+                    
+                    # Store epoch metrics
+                    epoch_metrics.append({
+                        'epoch': epoch,
+                        'loss': epoch_avg_loss,
+                        'accuracy': epoch_accuracy,
+                        'min_batch_loss': min(batch_losses),
+                        'max_batch_loss': max(batch_losses),
+                        'min_batch_accuracy': min(batch_accuracies),
+                        'max_batch_accuracy': max(batch_accuracies)
+                    })
+                    
+                    total_samples += epoch_total
+                else:
+                    logger.error(f"No batches processed in epoch {epoch + 1}")
+                    return None
+
+            if not epoch_metrics:  # If no epochs were completed successfully
+                return None
+
+            # Calculate final metrics
+            losses = [m['loss'] for m in epoch_metrics]
+            accuracies = [m['accuracy'] for m in epoch_metrics]
             
-            # Store epoch metrics
-            epoch_metrics.append({
-                'epoch': epoch,
-                'loss': epoch_avg_loss,
-                'accuracy': epoch_accuracy,
-                'min_batch_loss': min(batch_losses),
-                'max_batch_loss': max(batch_losses),
-                'min_batch_accuracy': min(batch_accuracies),
-                'max_batch_accuracy': max(batch_accuracies)
-            })
-            
-            total_samples += epoch_total
+            metrics = {
+                'loss': sum(losses) / len(losses),
+                'accuracy': sum(accuracies) / len(accuracies),
+                'min_loss': min(losses),
+                'max_loss': max(losses),
+                'std_loss': torch.tensor(losses).std().item(),
+                'min_accuracy': min(accuracies),
+                'max_accuracy': max(accuracies),
+                'std_accuracy': torch.tensor(accuracies).std().item(),
+                'total_samples': total_samples,
+                'epoch_metrics': epoch_metrics
+            }
 
-        # Calculate final metrics
-        losses = [m['loss'] for m in epoch_metrics]
-        accuracies = [m['accuracy'] for m in epoch_metrics]
-        
-        metrics = {
-            'loss': sum(losses) / len(losses),
-            'accuracy': sum(accuracies) / len(accuracies),
-            'min_loss': min(losses),
-            'max_loss': max(losses),
-            'std_loss': torch.tensor(losses).std().item(),
-            'min_accuracy': min(accuracies),
-            'max_accuracy': max(accuracies),
-            'std_accuracy': torch.tensor(accuracies).std().item(),
-            'total_samples': total_samples,
-            'epoch_metrics': epoch_metrics
-        }
+            return metrics
 
-        return metrics
+        except Exception as e:
+            logger.error(f"Error in training loop: {str(e)}")
+            return None
 
     def _send_model_update(self, round_num: int, metrics: Dict[str, float]):
         """Send local model update to orchestrator with improved retry logic"""
@@ -334,16 +397,15 @@ class FederatedClient:
                     logger.warning("Connection lost, attempting to reconnect...")
                     self.connect()
 
-                # Save model state dict to buffer
-                buffer = io.BytesIO()
-                torch.save(self.model.state_dict(), buffer)
+                # Compress state dict before sending
+                compressed_dict = self._compress_state_dict(self.model.state_dict())
                 
                 # Create complete message
                 message = {
                     'client_id': self.client_id,
                     'round': round_num,
                     'metrics': metrics,
-                    'state_dict': buffer.getvalue().hex()
+                    'state_dict': compressed_dict.hex()
                 }
                 
                 # Send as JSON with persistence
@@ -352,8 +414,9 @@ class FederatedClient:
                     routing_key='model_updates',
                     body=json.dumps(message).encode(),
                     properties=pika.BasicProperties(
-                        delivery_mode=2,  # make message persistent
-                        content_type='application/json'
+                        delivery_mode=2,
+                        content_type='application/json',
+                        expiration=str(self.message_ttl)
                     ),
                     mandatory=True
                 )
@@ -382,24 +445,31 @@ if __name__ == "__main__":
     heartbeat = int(os.getenv('RABBITMQ_HEARTBEAT', '600'))
     connection_retry_delay = int(os.getenv('CONNECTION_RETRY_DELAY', '5'))
     max_connection_retries = int(os.getenv('MAX_CONNECTION_RETRIES', '3'))
+    message_ttl = int(os.getenv('MESSAGE_TTL', '300000'))
 
     logger.info(f"Starting client {client_id}")
 
-    client = FederatedClient(
-        client_id=client_id,
-        data_dir=data_dir,
-        rabbitmq_host=rabbitmq_host,
-        local_epochs=local_epochs,
-        batch_size=batch_size,
-        heartbeat=heartbeat,
-        connection_retry_delay=connection_retry_delay,
-        max_connection_retries=max_connection_retries
-    )
-
     try:
+        client = FederatedClient(
+            client_id=client_id,
+            data_dir=data_dir,
+            rabbitmq_host=rabbitmq_host,
+            local_epochs=local_epochs,
+            batch_size=batch_size,
+            heartbeat=heartbeat,
+            connection_retry_delay=connection_retry_delay,
+            max_connection_retries=max_connection_retries,
+            message_ttl=message_ttl
+        )
+
         client.start()
     except KeyboardInterrupt:
         logger.info("Shutting down client...")
+    except Exception as e:
+        logger.error(f"Fatal error in client: {str(e)}")
     finally:
-        if client.connection and not client.connection.is_closed:
-            client.connection.close()
+        if hasattr(client, 'connection') and client.connection and not client.connection.is_closed:
+            try:
+                client.connection.close()
+            except Exception as e:
+                logger.error(f"Error closing connection: {str(e)}")

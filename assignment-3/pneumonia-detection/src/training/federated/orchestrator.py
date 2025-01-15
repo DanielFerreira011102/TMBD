@@ -4,7 +4,7 @@ from pathlib import Path
 import pika
 import io
 import json
-from typing import Dict, Set
+from typing import Dict, Set, Optional
 import mlflow
 import os
 import time
@@ -25,9 +25,10 @@ class FederatedOrchestrator:
         min_clients: int = 2,
         rounds: int = 10,
         wait_time: int = 3600,
-        heartbeat: int = 600,  # Increased heartbeat timeout to 10 minutes
+        heartbeat: int = 600,  # 10 minutes
         connection_retry_delay: int = 5,
-        max_connection_retries: int = 3
+        max_connection_retries: int = 3,
+        message_ttl: int = 300000  # 5 minutes in milliseconds
     ):
         self.num_clients = num_clients
         self.min_clients = min_clients
@@ -39,6 +40,7 @@ class FederatedOrchestrator:
         self.heartbeat = heartbeat
         self.connection_retry_delay = connection_retry_delay
         self.max_connection_retries = max_connection_retries
+        self.message_ttl = message_ttl
 
         # Initialize model
         self.global_model = PneumoniaClassifier(use_pretrained_weights=True)
@@ -67,7 +69,9 @@ class FederatedOrchestrator:
             blocked_connection_timeout=300,
             connection_attempts=3,
             retry_delay=5,
-            socket_timeout=300
+            socket_timeout=300,
+            channel_max=2,  # Limit number of channels
+            frame_max=131072  # Limit frame size (128KB)
         )
 
     def connect(self):
@@ -88,22 +92,34 @@ class FederatedOrchestrator:
                 # Enable publisher confirms
                 self.channel.confirm_delivery()
 
-                # Declare exchange and queues with persistence
+                # Declare exchange and queues with message limits and persistence
                 self.channel.exchange_declare(
                     exchange='global_model_exchange',
                     exchange_type='fanout',
                     durable=True
                 )
+                
+                # Model updates queue with limits
                 self.channel.queue_declare(
                     queue='model_updates',
-                    durable=True
+                    durable=True,
+                    arguments={
+                        'x-message-ttl': self.message_ttl,
+                        'x-max-length': 1000,
+                        'x-overflow': 'drop-head'
+                    }
                 )
                 
-                # Add registration queue
+                # Registration queue with limits
                 self.registration_queue = 'client_registrations'
                 self.channel.queue_declare(
                     queue=self.registration_queue,
-                    durable=True
+                    durable=True,
+                    arguments={
+                        'x-message-ttl': self.message_ttl,
+                        'x-max-length': 1000,
+                        'x-overflow': 'drop-head'
+                    }
                 )
                 
                 logger.info("Successfully connected to RabbitMQ")
@@ -117,6 +133,21 @@ class FederatedOrchestrator:
                 else:
                     self.should_reconnect = True
                     raise
+
+    def _cleanup_queues(self):
+        """Clean up queues to prevent memory buildup"""
+        try:
+            self.channel.queue_purge(queue='model_updates')
+            self.channel.queue_purge(queue=self.registration_queue)
+            logger.info("Successfully purged queues")
+        except Exception as e:
+            logger.warning(f"Error purging queues: {str(e)}")
+
+    def _compress_state_dict(self, state_dict):
+        """Compress model state dict for efficient transmission"""
+        buffer = io.BytesIO()
+        torch.save(state_dict, buffer, _use_new_zipfile_serialization=True)
+        return buffer.getvalue()
 
     def _process_heartbeat(self):
         """Process RabbitMQ heartbeat with error handling"""
@@ -148,7 +179,12 @@ class FederatedOrchestrator:
         def registration_callback(ch, method, properties, body):
             try:
                 client_info = json.loads(body.decode())
-                client_id = client_info['client_id']
+                client_id = client_info.get('client_id')
+                
+                if not client_id:
+                    logger.error("Received registration without client_id")
+                    return
+                    
                 if client_id not in self.registered_clients:
                     self.registered_clients.add(client_id)
                     logger.info(f"Client {client_id} registered. Total registered: {len(self.registered_clients)}")
@@ -156,6 +192,9 @@ class FederatedOrchestrator:
                 logger.error(f"Error processing registration: {str(e)}")
             finally:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
+
+        # Clean up old registrations
+        self._cleanup_queues()
 
         while len(self.registered_clients) < self.min_clients:
             try:
@@ -188,14 +227,16 @@ class FederatedOrchestrator:
                 if not self.connection or self.connection.is_closed:
                     self._handle_connection_error()
 
-                # Save state dict to buffer
-                buffer = io.BytesIO()
-                torch.save(self.global_model.state_dict(), buffer)
+                # Clean up old messages
+                self._cleanup_queues()
+
+                # Compress and save state dict
+                compressed_dict = self._compress_state_dict(self.global_model.state_dict())
                 
                 # Create complete message
                 message = {
                     'round': self.current_round,
-                    'state_dict': buffer.getvalue().hex()
+                    'state_dict': compressed_dict.hex()
                 }
 
                 # Send with persistence and mandatory flag
@@ -204,8 +245,9 @@ class FederatedOrchestrator:
                     routing_key='',
                     body=json.dumps(message).encode(),
                     properties=pika.BasicProperties(
-                        delivery_mode=2,  # make message persistent
-                        content_type='application/json'
+                        delivery_mode=2,
+                        content_type='application/json',
+                        expiration=str(self.message_ttl)
                     ),
                     mandatory=True
                 )
@@ -232,10 +274,20 @@ class FederatedOrchestrator:
             client_id = None
             try:
                 message = json.loads(body.decode())
-                client_id = message['client_id']
+                client_id = message.get('client_id')
+                
+                if not client_id:
+                    logger.error("Received update without client_id")
+                    return
                 
                 if client_id not in active_clients:
                     logger.warning(f"Received update from unregistered client {client_id}")
+                    return
+                
+                # Validate required fields
+                required_fields = ['round', 'state_dict', 'metrics']
+                if not all(field in message for field in required_fields):
+                    logger.error(f"Received incomplete update from client {client_id}")
                     return
                 
                 state_dict = torch.load(
@@ -263,6 +315,9 @@ class FederatedOrchestrator:
                 logger.error(f"{error_msg}: {str(e)}")
             finally:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
+
+        # Clean up old updates
+        self._cleanup_queues()
 
         while len(collected_clients) < min(self.min_clients, len(active_clients)):
             try:
@@ -294,6 +349,9 @@ class FederatedOrchestrator:
 
         self.channel.stop_consuming()
 
+        # Clean up memory after processing
+        self._cleanup_queues()
+
         # Check if we have enough active clients to continue
         if len(active_clients) < self.min_clients:
             logger.error(f"Not enough active clients to continue training. "
@@ -302,6 +360,44 @@ class FederatedOrchestrator:
 
         # If we have enough active clients but some didn't respond, continue anyway
         return len(collected_clients) >= min(self.min_clients, len(active_clients))
+
+    def _aggregate_updates(self):
+        """Aggregate client updates using FedAvg algorithm with memory management"""
+        if not self.received_updates:
+            return
+
+        try:
+            aggregated_state = {}
+            first_state = next(iter(self.received_updates.values()))['state_dict']
+
+            # Initialize aggregated state
+            for key in first_state.keys():
+                aggregated_state[key] = torch.zeros_like(first_state[key], dtype=first_state[key].dtype)
+
+            # Process updates one at a time to manage memory
+            num_updates = len(self.received_updates)
+            for client_id, update in self.received_updates.items():
+                try:
+                    state_dict = update['state_dict']
+                    for key in aggregated_state.keys():
+                        if state_dict[key].dtype == torch.long:
+                            aggregated_state[key] += (state_dict[key].float() / num_updates).round().to(state_dict[key].dtype)
+                        else:
+                            aggregated_state[key] += state_dict[key] / num_updates
+                    
+                    # Free memory as we go
+                    del state_dict
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                except Exception as e:
+                    logger.error(f"Error processing update from client {client_id}: {str(e)}")
+
+            self.global_model.load_state_dict(aggregated_state)
+            logger.info(f"Updated global model with {num_updates} client updates")
+
+        except Exception as e:
+            logger.error(f"Error in model aggregation: {str(e)}")
 
     def start_training(self):
         """Start federated learning process with improved error handling"""
@@ -340,7 +436,11 @@ class FederatedOrchestrator:
                     self._aggregate_updates()
                     self._aggregate_and_log_metrics(round_num)
                     self._save_model(round_num)
+                    
+                    # Clear updates to free memory
                     self.received_updates.clear()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 except Exception as e:
                     logger.error(f"Error in training round {round_num + 1}: {str(e)}")
@@ -361,30 +461,7 @@ class FederatedOrchestrator:
             except Exception as e:
                 logger.error(f"Error saving final model: {str(e)}")
 
-    def _aggregate_updates(self):
-        """Aggregate client updates using FedAvg algorithm"""
-        if not self.received_updates:
-            return
-
-        aggregated_state = {}
-        first_state = next(iter(self.received_updates.values()))['state_dict']
-
-        for key in first_state.keys():
-            aggregated_state[key] = torch.zeros_like(first_state[key], dtype=first_state[key].dtype)
-
-        num_updates = len(self.received_updates)
-        for update in self.received_updates.values():
-            state_dict = update['state_dict']
-            for key in aggregated_state.keys():
-                if state_dict[key].dtype == torch.long:
-                    aggregated_state[key] += (state_dict[key].float() / num_updates).round().to(state_dict[key].dtype)
-                else:
-                    aggregated_state[key] += state_dict[key] / num_updates
-
-        self.global_model.load_state_dict(aggregated_state)
-        logger.info(f"Updated global model with {num_updates} client updates")
-
-    def _save_model(self, round_num: int = None):
+    def _save_model(self, round_num: Optional[int] = None):
         """Save model with error handling"""
         try:
             model_path = self.model_dir / 'final_federated_model.pth'
@@ -397,31 +474,29 @@ class FederatedOrchestrator:
             )
             logger.info(f"Saved model to {model_path}")
             
-            # Log to MLflow with appropriate tags and metadata
-            tags = {
+            # Set tags for the current run
+            mlflow.set_tags({
                 "round": str(round_num) if round_num is not None else "final",
                 "timestamp": datetime.now().isoformat()
-            }
+            })
             
             if round_num is not None:
                 mlflow.pytorch.log_model(
                     self.global_model, 
                     f"model_round_{round_num + 1}",
-                    registered_model_name="federated_model",
-                    tags=tags
+                    registered_model_name="federated_model"
                 )
             else:
                 mlflow.pytorch.log_model(
                     self.global_model,
                     "final_model",
-                    registered_model_name="federated_model",
-                    tags=tags
+                    registered_model_name="federated_model"
                 )
         except Exception as e:
             logger.error(f"Error saving model: {str(e)}")
 
     def _aggregate_and_log_metrics(self, round_num: int):
-        """Aggregate and log metrics from all clients with improved MLflow tracking"""
+        """Aggregate and log metrics with improved MLflow tracking"""
         if not self.received_updates:
             return
 
@@ -451,8 +526,6 @@ class FederatedOrchestrator:
             # Per-client metrics
             for client_id, update in self.received_updates.items():
                 metrics = update['metrics']
-                
-                # Main client metrics
                 client_metrics = {
                     f"clients/{client_id}/loss": metrics['loss'],
                     f"clients/{client_id}/accuracy": metrics['accuracy'],
@@ -466,33 +539,19 @@ class FederatedOrchestrator:
                 }
                 mlflow.log_metrics(client_metrics, step=round_num)
 
-                # Per-epoch metrics for each client
-                for epoch_data in metrics['epoch_metrics']:
-                    epoch = epoch_data['epoch']
-                    epoch_metrics = {
-                        f"clients/{client_id}/epochs/loss_{epoch}": epoch_data['loss'],
-                        f"clients/{client_id}/epochs/accuracy_{epoch}": epoch_data['accuracy'],
-                        f"clients/{client_id}/epochs/min_batch_loss_{epoch}": epoch_data['min_batch_loss'],
-                        f"clients/{client_id}/epochs/max_batch_loss_{epoch}": epoch_data['max_batch_loss'],
-                        f"clients/{client_id}/epochs/min_batch_accuracy_{epoch}": epoch_data['min_batch_accuracy'],
-                        f"clients/{client_id}/epochs/max_batch_accuracy_{epoch}": epoch_data['max_batch_accuracy']
-                    }
-                    mlflow.log_metrics(epoch_metrics, step=round_num)
-
-            # Log additional metadata for this round
-            metadata = {
-                "round_info": {
-                    "round_number": round_num + 1,
-                    "total_rounds": self.rounds,
-                    "timestamp": datetime.now().isoformat(),
-                    "active_clients": list(self.received_updates.keys()),
-                    "samples_per_client": {
-                        client_id: update['metrics']['total_samples']
-                        for client_id, update in self.received_updates.items()
-                    }
-                }
-            }
-            mlflow.log_dict(metadata, f"round_{round_num + 1}_metadata.json")
+                # Log per-epoch metrics for each client
+                if 'epoch_metrics' in metrics:
+                    for epoch_data in metrics['epoch_metrics']:
+                        epoch = epoch_data['epoch']
+                        epoch_metrics = {
+                            f"clients/{client_id}/epochs/loss_{epoch}": epoch_data['loss'],
+                            f"clients/{client_id}/epochs/accuracy_{epoch}": epoch_data['accuracy'],
+                            f"clients/{client_id}/epochs/min_batch_loss_{epoch}": epoch_data['min_batch_loss'],
+                            f"clients/{client_id}/epochs/max_batch_loss_{epoch}": epoch_data['max_batch_loss'],
+                            f"clients/{client_id}/epochs/min_batch_accuracy_{epoch}": epoch_data['min_batch_accuracy'],
+                            f"clients/{client_id}/epochs/max_batch_accuracy_{epoch}": epoch_data['max_batch_accuracy']
+                        }
+                        mlflow.log_metrics(epoch_metrics, step=round_num)
 
             logger.info(f"Round {round_num + 1} metrics - "
                        f"Mean Loss: {global_metrics['global/loss']:.4f}, "
@@ -513,6 +572,7 @@ if __name__ == "__main__":
     heartbeat = int(os.getenv('RABBITMQ_HEARTBEAT', '600'))
     connection_retry_delay = int(os.getenv('CONNECTION_RETRY_DELAY', '5'))
     max_connection_retries = int(os.getenv('MAX_CONNECTION_RETRIES', '3'))
+    message_ttl = int(os.getenv('MESSAGE_TTL', '300000'))
 
     logger.info(f"Starting orchestrator with {num_clients} clients")
 
@@ -525,7 +585,8 @@ if __name__ == "__main__":
             rabbitmq_host=rabbitmq_host,
             heartbeat=heartbeat,
             connection_retry_delay=connection_retry_delay,
-            max_connection_retries=max_connection_retries
+            max_connection_retries=max_connection_retries,
+            message_ttl=message_ttl
         )
 
         orchestrator.start_training()

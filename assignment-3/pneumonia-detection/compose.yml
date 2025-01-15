@@ -5,10 +5,6 @@ services:
     ports:
       - "5672:5672"   # AMQP protocol
       - "15672:15672" # Management UI (http://localhost:15672, guest/guest)
-    deploy:
-      resources:
-        limits:
-          memory: 2048M
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
       interval: 30s
